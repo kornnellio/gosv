@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Cgroup manages a cgroup v2 for resource limits
@@ -21,6 +23,13 @@ import (
 //   cpu.max             - CPU bandwidth limit "quota period" (e.g., "50000 100000" = 50%)
 //   cpu.stat            - CPU usage statistics
 //   pids.max            - Maximum number of processes
+//
+// SYSTEMD INTEGRATION:
+// On systemd systems, the root cgroup is managed by systemd. We cannot create
+// cgroups directly under /sys/fs/cgroup. Instead, we:
+// 1. Find our current cgroup (from /proc/self/cgroup)
+// 2. Create a "gosv" subcgroup there
+// 3. Enable controllers and create per-process cgroups
 type Cgroup struct {
 	name string
 	path string
@@ -28,9 +37,166 @@ type Cgroup struct {
 
 const cgroupRoot = "/sys/fs/cgroup"
 
-// NewCgroup creates a new cgroup under the root
+var (
+	// baseCgroupPath is where we create our cgroups
+	// Set by EnsureControllers() based on system configuration
+	baseCgroupPath string
+)
+
+// getSelfCgroup returns the cgroup path of the current process
+// Reads from /proc/self/cgroup which has format "0::/path/to/cgroup"
+func getSelfCgroup() (string, error) {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", err
+	}
+
+	// Format for cgroup v2: "0::/user.slice/user-1000.slice/..."
+	line := strings.TrimSpace(string(data))
+	parts := strings.SplitN(line, "::", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("unexpected cgroup format: %s", line)
+	}
+
+	return parts[1], nil
+}
+
+// hasCgroupDelegation checks if the current cgroup has delegation enabled
+// by testing if we can create a child cgroup and enable controllers
+func hasCgroupDelegation() bool {
+	selfCgroup, err := getSelfCgroup()
+	if err != nil {
+		return false
+	}
+
+	// Try to create test cgroup
+	testPath := filepath.Join(cgroupRoot, selfCgroup, ".gosv-test")
+	if err := os.Mkdir(testPath, 0755); err != nil {
+		return false
+	}
+	defer os.Remove(testPath)
+
+	// Check if subtree_control exists and is writable in parent
+	parentPath := filepath.Join(cgroupRoot, selfCgroup)
+	controlPath := filepath.Join(parentPath, "cgroup.subtree_control")
+
+	// Try enabling a controller
+	if err := os.WriteFile(controlPath, []byte("+memory"), 0644); err != nil {
+		return false
+	}
+
+	return true
+}
+
+// RunWithDelegation re-executes the current process with systemd-run for cgroup delegation
+// Returns true if re-exec happened (caller should exit), false if not needed or failed
+func RunWithDelegation() bool {
+	// Check if we already have delegation
+	if hasCgroupDelegation() {
+		return false
+	}
+
+	// Check if systemd-run is available
+	systemdRun, err := exec.LookPath("systemd-run")
+	if err != nil {
+		fmt.Println("[gosv] systemd-run not found, continuing without cgroup delegation")
+		return false
+	}
+
+	// Check if we're already in a delegated scope (avoid infinite loop)
+	if os.Getenv("GOSV_DELEGATED") == "1" {
+		fmt.Println("[gosv] already in delegated scope but delegation failed")
+		return false
+	}
+
+	fmt.Println("[gosv] requesting cgroup delegation via systemd-run...")
+
+	// Build command to re-exec ourselves
+	args := []string{
+		"--user",           // User scope
+		"--scope",          // Transient scope (not service)
+		"-p", "Delegate=yes", // Enable delegation
+		"--",
+	}
+	args = append(args, os.Args...)
+
+	cmd := exec.Command(systemdRun, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "GOSV_DELEGATED=1")
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		fmt.Printf("[gosv] systemd-run failed: %v\n", err)
+		return false
+	}
+
+	os.Exit(0)
+	return true // Never reached
+}
+
+// findWritableCgroupBase finds a cgroup path where we can create children
+// Tries in order:
+// 1. Current process's cgroup (for systemd user sessions with delegation)
+// 2. /sys/fs/cgroup directly (for root or non-systemd systems)
+//
+// KEY CONCEPT: cgroup v2 "no internal processes" rule
+// A cgroup cannot have both processes AND children with controllers.
+// To enable controllers for children, we must first move all processes
+// from the parent to a leaf cgroup.
+func findWritableCgroupBase() (string, error) {
+	// Try 1: Use our current cgroup (works with systemd delegation)
+	selfCgroup, err := getSelfCgroup()
+	if err == nil && selfCgroup != "" {
+		parentPath := filepath.Join(cgroupRoot, selfCgroup)
+
+		// KEY CONCEPT: To enable controllers in subtree_control, the cgroup
+		// must have no processes. We need to:
+		// 1. Create a "supervisor" leaf cgroup for ourselves
+		// 2. Move ourselves there
+		// 3. Enable controllers in the parent
+		// 4. Create per-service cgroups
+
+		supervisorPath := filepath.Join(parentPath, "supervisor")
+		if err := os.MkdirAll(supervisorPath, 0755); err == nil {
+			// Move ourselves to the supervisor cgroup
+			procsPath := filepath.Join(supervisorPath, "cgroup.procs")
+			if err := os.WriteFile(procsPath, []byte(strconv.Itoa(os.Getpid())), 0644); err == nil {
+				// Now enable controllers in the parent (which is now empty)
+				controlPath := filepath.Join(parentPath, "cgroup.subtree_control")
+				if err := os.WriteFile(controlPath, []byte("+cpu +memory +pids"), 0644); err == nil {
+					// Success! Return the parent as the base for service cgroups
+					return parentPath, nil
+				}
+			}
+		}
+
+		// Fallback: try without moving (might work if already set up)
+		path := filepath.Join(parentPath, "gosv")
+		if err := os.MkdirAll(path, 0755); err == nil {
+			return path, nil
+		}
+	}
+
+	// Try 2: Direct root access (requires root, non-systemd)
+	path := filepath.Join(cgroupRoot, "gosv")
+	if err := os.MkdirAll(path, 0755); err == nil {
+		return path, nil
+	}
+
+	return "", fmt.Errorf("no writable cgroup location found - try running with: systemd-run --user --scope -p Delegate=yes ./gosv")
+}
+
+// NewCgroup creates a new cgroup for a process
 func NewCgroup(name string) (*Cgroup, error) {
-	path := filepath.Join(cgroupRoot, "gosv", name)
+	if baseCgroupPath == "" {
+		return nil, fmt.Errorf("cgroups not initialized - call EnsureControllers first")
+	}
+
+	path := filepath.Join(baseCgroupPath, name)
 
 	// Create the cgroup directory
 	// KEY CONCEPT: Creating a directory in cgroupfs creates a new cgroup
@@ -102,7 +268,7 @@ func (c *Cgroup) GetMemoryUsage() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.ParseInt(string(data[:len(data)-1]), 10, 64)
+	return strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
 }
 
 // Destroy removes the cgroup
@@ -113,24 +279,37 @@ func (c *Cgroup) Destroy() error {
 	return os.Remove(c.path)
 }
 
-// EnsureControllers enables required controllers on parent cgroup
+// EnsureControllers finds a writable cgroup and enables required controllers
 func EnsureControllers() error {
-	// KEY CONCEPT: cgroup.subtree_control
-	// Parent cgroup must enable controllers for children to use them
-	// Write "+cpu +memory +pids" to enable those controllers
-
-	gosvPath := filepath.Join(cgroupRoot, "gosv")
-	if err := os.MkdirAll(gosvPath, 0755); err != nil {
+	// Find a cgroup location where we can create children
+	path, err := findWritableCgroupBase()
+	if err != nil {
 		return err
 	}
 
-	// Enable controllers on root for our subtree
-	// Note: This may fail if controllers aren't available
-	controlPath := filepath.Join(cgroupRoot, "cgroup.subtree_control")
+	baseCgroupPath = path
+
+	// KEY CONCEPT: cgroup.subtree_control
+	// Parent cgroup must enable controllers for children to use them
+	// Write "+cpu +memory +pids" to enable those controllers
+	controlPath := filepath.Join(baseCgroupPath, "cgroup.subtree_control")
 	content := "+cpu +memory +pids"
 
-	// Best effort - some systems may not have all controllers
-	_ = os.WriteFile(controlPath, []byte(content), 0644)
+	// Enable controllers for our child cgroups
+	if err := os.WriteFile(controlPath, []byte(content), 0644); err != nil {
+		// Not fatal - controllers might already be enabled or not available
+		fmt.Printf("[gosv] note: could not enable all controllers: %v\n", err)
+	}
 
+	fmt.Printf("[gosv] using cgroup path: %s\n", baseCgroupPath)
 	return nil
+}
+
+// CleanupCgroups removes the gosv cgroup directory
+func CleanupCgroups() error {
+	if baseCgroupPath == "" {
+		return nil
+	}
+	// Try to remove our base cgroup (will fail if not empty, which is fine)
+	return os.Remove(baseCgroupPath)
 }

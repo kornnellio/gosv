@@ -25,7 +25,14 @@ type ServiceConfig struct {
 func main() {
 	configPath := flag.String("config", "", "Path to config file (JSON)")
 	singleCmd := flag.String("run", "", "Run a single command")
+	noCgroup := flag.Bool("no-cgroup", false, "Disable cgroup resource limits")
 	flag.Parse()
+
+	// Try to get cgroup delegation via systemd-run if needed
+	// This will re-exec the process if delegation is required
+	if !*noCgroup {
+		RunWithDelegation()
+	}
 
 	// Show what we're about to do
 	fmt.Println("=== gosv: Process Supervisor ===")
@@ -59,9 +66,13 @@ func main() {
 	}
 
 	// Initialize cgroups (best effort)
-	if err := EnsureControllers(); err != nil {
-		fmt.Printf("[gosv] warning: cgroup setup failed: %v\n", err)
-		fmt.Println("[gosv] continuing without resource limits")
+	if !*noCgroup {
+		if err := EnsureControllers(); err != nil {
+			fmt.Printf("[gosv] warning: cgroup setup failed: %v\n", err)
+			fmt.Println("[gosv] continuing without resource limits")
+		}
+	} else {
+		fmt.Println("[gosv] cgroups disabled via --no-cgroup flag")
 	}
 
 	if err := sup.Run(); err != nil {
