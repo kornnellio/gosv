@@ -1,0 +1,20 @@
+{
+  "services": [
+    {
+      "name": "webserver",
+      "command": "/usr/bin/python3",
+      "args": ["-m", "http.server", "8080"],
+      "max_restarts": 5,
+      "memory_mb": 256,
+      "cpu_percent": 50
+    },
+    {
+      "name": "worker",
+      "command": "/bin/sh",
+      "args": ["-c", "while true; do echo 'processing...'; sleep 5; done"],
+      "max_restarts": 10,
+      "memory_mb": 128,
+      "cpu_percent": 25
+    }
+  ]
+}
